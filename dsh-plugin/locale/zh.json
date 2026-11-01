@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Open Computer Use",
+    "description": "把 Open Computer Use 的 9 个 native 工具通过 DSH MCP 客户端接入当前 profile（工具名 mcp__ocu__*），进程管理、回合边界处理和技能注册都由插件负责。"
+  }
+}

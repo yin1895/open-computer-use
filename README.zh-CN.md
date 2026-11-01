@@ -148,6 +148,10 @@ open-computer-use -h
 ocu -h
 ```
 
+### DeepSeek Harness（DSH）插件
+
+[`dsh-plugin/`](./dsh-plugin) 是一个可直接安装的 DSH bundle，把 Open Computer Use 的 9 个工具以 `mcp__ocu__*` 的形式接入 DSH profile：它自带 profile patch（插入 dsh 自带的 `@deepseek-ai/dsh-mcp-client` 行，外加负责回合边界与技能注册的 Host 侧），父 profile 一行都不用改。它是 [`scripts/install-dsh-mcp.sh`](./scripts/install-dsh-mcp.sh) 那种直接改 profile 做法的打包替代。用 DSH 插件管理器安装（`install_bundle`，target 指向 `dsh-plugin/` 的绝对路径），配置字段和验证方法见 [`dsh-plugin/README.md`](./dsh-plugin/README.md)。
+
 ## 全局配置
 
 ocu 1.0.0后支持全局配置，以适应不同的使用方式和业务场景，默认配置存在 `~/.config/ocu/config.json`，期间可以直接到文件里编辑配置，也可以通过`ocu config`子命令去配置，更具体的可以看： [配置说明](docs/configuration.zh-CN.md)

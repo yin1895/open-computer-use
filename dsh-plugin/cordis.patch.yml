@@ -1,0 +1,63 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# @yin1895/dsh-open-computer-use — bundle patch
+#
+# Installing this bundle inserts two rows and touches no other layer of the
+# profile:
+#
+#   1. `open-computer-use`      this package's own Host half (index.js). It owns
+#                              what the MCP client cannot do: turn-boundary
+#                              cursor cleanup and skill registration.
+#   2. `open-computer-use-mcp`  the shipped `@deepseek-ai/dsh-mcp-client`,
+#                              pointed at the Open Computer Use native stdio MCP
+#                              server. `serverName: ocu` is what makes the nine
+#                              tools reach the model as `mcp__ocu__<tool>`.
+#
+# ROW 2 IS THE WHOLE INTEGRATION. `@deepseek-ai/dsh-mcp-client` ships with dsh,
+# so it always resolves, and the parent profile patch stays untouched — swapping
+# scripts/install-dsh-mcp.sh for a versioned bundle is exactly the point.
+#
+# CONFIG IS REPLACED, NOT DEEP-MERGED
+# 重要：`config` 是整体替换，不做深合并。A matching override replaces the
+# complete `config` mapping of that row. To change one field, repeat every field
+# you want to keep; a partial `config` silently drops the rest.
+#
+# `command` must be an ABSOLUTE path. The `ocu` / `open-computer-use` names on
+# PATH are .ps1/.cmd shims, and a GUI or background launch does not necessarily
+# inherit the installer's PATH, so a bare command name is not enough. The path
+# below is the native binary the global npm package installs on Windows; replace
+# it per platform (on macOS, the app bundle's
+# `Contents/MacOS/OpenComputerUse`).
+#
+# `failOnStartupError: false` keeps the Harness startable when Open Computer Use
+# is missing or refuses to start: the tools are then absent instead of rejecting
+# activation for the whole profile.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- insert:
+    - id: open-computer-use
+      name: '@yin1895/dsh-open-computer-use'
+      config:
+        # Same native binary as row 2 below; used for the cursor / turn-boundary
+        # calls this row owns.
+        command: 'C:\Users\Administrator\AppData\Local\nvm\v24.21.0\node_modules\open-computer-use\dist\windows\amd64\open-computer-use.exe'
+        args:
+          - mcp
+        serverName: ocu
+        toolCallTimeoutMs: 60000
+        enableTurnBoundaryHook: true
+        registerSkill: true
+        cursorCleanupCommand: ''
+        # `env` and `cwd` are optional. Adding either one replaces the whole
+        # `config` mapping above, so repeat every field you want to keep.
+        # env: {}
+        # cwd: ''
+
+    - id: open-computer-use-mcp
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: ocu
+        transport: stdio
+        command: 'C:\Users\Administrator\AppData\Local\nvm\v24.21.0\node_modules\open-computer-use\dist\windows\amd64\open-computer-use.exe'
+        args:
+          - mcp
+        failOnStartupError: false
