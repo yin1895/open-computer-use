@@ -26,11 +26,24 @@
   },
   "files": [
     "index.js",
+    "self-check.mjs",
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg",
     "README.md"
   ],
+  "scripts": {
+    "self-check": "node self-check.mjs --probe-turn-ended",
+    "doctor": "node index.js --doctor"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/schemastery": "~3.18.5"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/schemastery": {
+      "optional": true
+    }
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
