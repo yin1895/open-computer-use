@@ -172,6 +172,24 @@ to a bare `open-computer-use` when it is on the Harness process's `PATH`. Both r
 carry `failOnStartupError`-style tolerance — the MCP row is `false` and this row only
 logs — so a wrong path leaves the nine tools absent instead of breaking the profile.
 
+**Replacing an install.** A branch tarball is fetched by URL, and pnpm treats an
+unchanged spec as already satisfied — so republishing this branch does **not** update
+a profile that has already installed it (`Already up to date`, `downloaded 0`). Remove
+the bundle and install it again to pick up new content.
+
+**Pending builds block every package operation.** When any other package in the
+profile has an unapproved `postinstall`, pnpm 11 reports `ERR_PNPM_IGNORED_BUILDS`,
+the operation fails with `kind: "build-blocked"`, and the failure is unrelated to this
+package. Retry with `approvedBuilds` set to the exact `pendingBuilds` entry that was
+reported. On the profile this was developed against, that approval had to be re-passed
+on **every** operation: neither pnpm's own record nor the other package's
+self-allow-listing made it stick.
+
+**Restart after replacing.** Swapping the installed package does not swap the running
+code. The rows re-apply, but the process keeps executing the module generation it
+loaded earlier, so a freshly installed copy can still report paths from the previous
+location until the Harness restarts.
+
 ### From this checkout
 
 1. Make sure a native Open Computer Use binary exists (the global npm install

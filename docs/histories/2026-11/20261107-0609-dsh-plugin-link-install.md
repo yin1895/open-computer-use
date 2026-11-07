@@ -98,11 +98,18 @@ profile 里的**任何**包操作。pnpm 输出显示我们的包其实**已从�
 
 经用户明确批准后，以 `approvedBuilds` 重试：postinstall 正常执行并自报
 `already in bundles` / `insert already in …cordis.patch.yml` / `allowed pnpm build for dsh-purge`，
-安装即 `applied`。副作用是 dsh-purge 获得了持久的脚本执行许可（按包名长期生效），
-换来该 profile 后续包操作不再被拦。
+安装即 `applied`。
+
+**但该批准并未持久生效**：随后再执行任何安装，仍然报同一个 `ERR_PNPM_IGNORED_BUILDS`
+（`pendingBuilds` 项不变），pnpm 自己的记录与 dsh-purge 的 `ensurePnpmAllowBuild` 都没有让拦截消失，
+因此每次包操作都得重新传 `approvedBuilds`。这一点与插件管理器 README 的预期（「Approval persists
+by package name in this profile」）不一致，属于本机 profile 的现状。
 
 ## 未覆盖 / 风险
 
+- **同 URL 重发不会更新已安装副本**：branch tarball 按 URL 命中，spec 未变时 pnpm 判定
+  `Already up to date`（`downloaded 0`），因此重发 `dsh-plugin-dist` 后，已安装的 profile 仍持有
+  旧内容（实测：重发后已装副本的 README 不含新增段落）。要换内容需先 `remove_bundle` 再装。
 - **代码换代需要重启**：替换已安装的包时，运行中的进程仍执行先前加载的模块代
   （`host-plugin.md`：「replacing an installed package requires restart to load a fresh JavaScript
   module generation」）。实测印证：安装后已安装副本自己的 `--doctor` 解析到
@@ -110,7 +117,9 @@ profile 里的**任何**包操作。pnpm 输出显示我们的包其实**已从�
   该技能的 `Base directory` 仍指向仓库路径 `D:\…\open-computer-use\skills\open-computer-use`
   （且 bundle 关→开时技能条目消失又重现，说明行确实重新激活过——只是模块代没换）。
   重启 Harness 后二者应一致。未擅自重启以免中断用户会话。
-- 生成分支需随 `dsh-plugin/` 的改动重新发布，否则链接安装拿到旧代码；README 已写明重新发布流程。
+- **发布树 pin 了本机绝对路径**：`cordis.patch.yml` 两处 `command:` 指向本机 ocu 可执行，
+  所以在别的机器上装完需要改这两处路径（或用 PATH 上的裸名）。已写入 `dsh-plugin/README.md`。
+- 生成分支需随 `dsh-plugin/` 的改动重新发布，否则新装的人拿到旧代码；README 已写明重新发布流程。
 - macOS 侧未在本机验证（本机为 Windows），与本插件既有结论一致。
 - 若将来要发到 npm，需要去掉 `dsh-plugin/package.json` 的 `private: true`。
 - dist 分支的树由 git 落盘，受全局 `core.autocrlf=true` 影响，行尾与本地构建树不同
