@@ -1,0 +1,56 @@
+{
+  "name": "@yin1895/dsh-open-computer-use",
+  "version": "1.2.0",
+  "private": true,
+  "type": "module",
+  "description": "DSH bundle that wires the Open Computer Use native tools into a profile through the shipped DSH MCP client, with the plugin owning process lifecycle, turn-boundary handling, and skill registration.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yin1895/open-computer-use.git",
+    "directory": "dsh-plugin"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "plugin",
+    "open-computer-use",
+    "computer-use",
+    "mcp"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "self-check.mjs",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "skills"
+  ],
+  "scripts": {
+    "self-check": "node self-check.mjs --probe-turn-ended",
+    "doctor": "node index.js --doctor"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/schemastery": "~3.18.5"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/schemastery": {
+      "optional": true
+    }
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

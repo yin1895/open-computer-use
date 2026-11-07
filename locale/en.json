@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Open Computer Use",
+    "description": "Wires the nine native Open Computer Use tools into this DSH profile through the shipped DSH MCP client (mcp__ocu__*). The plugin owns the executable location under the DSH home, the turn boundary, and skill registration."
+  }
+}
