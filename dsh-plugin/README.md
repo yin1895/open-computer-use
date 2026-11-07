@@ -163,6 +163,15 @@ git -C "$OUT" push --force https://github.com/yin1895/open-computer-use.git HEAD
 Read the `verified:` line and the file list the script prints before pushing; the
 commit message is irrelevant, the tree is the artifact.
 
+**Portability.** `cordis.patch.yml` pins the native binary as an absolute path —
+twice, once for this row's `command` and once for the MCP row. That is deliberate
+(a GUI or background launch does not necessarily inherit `PATH`, so a bare name is
+less reliable), but it means the published tree is tuned for the machine that built
+it. On another machine, edit those two `command:` lines after installing, or set them
+to a bare `open-computer-use` when it is on the Harness process's `PATH`. Both rows
+carry `failOnStartupError`-style tolerance — the MCP row is `false` and this row only
+logs — so a wrong path leaves the nine tools absent instead of breaking the profile.
+
 ### From this checkout
 
 1. Make sure a native Open Computer Use binary exists (the global npm install
