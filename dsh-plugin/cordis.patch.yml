@@ -5,8 +5,9 @@
 # profile:
 #
 #   1. `open-computer-use`      this package's own Host half (index.js). It owns
-#                              what the MCP client cannot do: turn-boundary
-#                              cursor cleanup and skill registration.
+#                              what the MCP client cannot do: executable
+#                              provisioning under the DSH home, turn-boundary
+#                              cursor cleanup, and skill registration.
 #   2. `open-computer-use-mcp`  the shipped `@deepseek-ai/dsh-mcp-client`,
 #                              pointed at the Open Computer Use native stdio MCP
 #                              server. `serverName: ocu` is what makes the nine
@@ -21,32 +22,67 @@
 # complete `config` mapping of that row. To change one field, repeat every field
 # you want to keep; a partial `config` silently drops the rest.
 #
-# `command` must be an ABSOLUTE path. The `ocu` / `open-computer-use` names on
-# PATH are .ps1/.cmd shims, and a GUI or background launch does not necessarily
-# inherit the installer's PATH, so a bare command name is not enough. The path
-# below is the native binary the global npm package installs on Windows; replace
-# it per platform (on macOS, the app bundle's
-# `Contents/MacOS/OpenComputerUse`).
+# ONE SOURCE OF TRUTH FOR THE EXECUTABLE LOCATION — 同源约定
+# 这个文件里的 `dshHomePath(...)` 参数，和 `index.js` 里的 `<cli-home>` 约定
+# 必须**同源**：改一处就要改另一处。两侧的对应关系是
+#
+#   patch:  !!js dshHomePath('<CLI_HOME_SEGMENT>/<CLI_BIN_DIR>/<CLI_BASENAME>.exe')
+#           → 本文件写作 dshHomePath('ocu/bin/open-computer-use.exe')
+#
+#   code:   cliHomeRelativeCommand() / SHIPPED_CLI_RELATIVE_COMMAND()，由常量
+#           CLI_HOME_SEGMENT + CLI_BIN_DIR + CLI_BASENAME + CLI_WINDOWS_EXTENSION
+#           拼出，`expectedCliPath()` 与 `shippedCliPath()` 都从它派生。
+#
+# `doctor()` 的 `cli-home-patch-parity` 检查会把本文件里的每个
+# `dshHomePath(...)` 参数和 `SHIPPED_CLI_RELATIVE_COMMAND` 逐字比较，self-check
+# 也有一条机械校验；两边一旦漂移就是 FAIL，不会静默。
+#
+# WHY A RELATIVE PATH AND NOT A LITERAL ONE. An earlier revision pinned this
+# expression to one author machine's absolute install directory, which meant the
+# shared artifact carried one machine's layout into everybody else's profile. The
+# location is now expressed relative to the DSH home — `dshHomePath()` is the
+# Harness' own Loader helper, used by shipped rows such as
+# `session-persistence-jsonl` — and `index.js` is what puts a real binary there
+# (adopt an existing install, else `npm install --prefix <cli-home>`).
+#
+# `command` must still be an ABSOLUTE path at spawn time. The `ocu` /
+# `open-computer-use` names on PATH are `.ps1`/`.cmd` shims, a `.cmd` cannot be
+# spawned directly (EINVAL / EFTYPE), and a GUI or background launch does not
+# necessarily inherit the installer's PATH. `dshHomePath()` resolves to an
+# absolute path before the row is validated, so the expression satisfies that
+# requirement without hard-coding a machine.
+#
+# `args: [mcp]` must stay: running the binary with no arguments only prints its
+# usage text and exits, so the MCP transport never starts.
 #
 # `failOnStartupError: false` keeps the Harness startable when Open Computer Use
-# is missing or refuses to start: the tools are then absent instead of rejecting
-# activation for the whole profile.
+# is missing or refuses to start: the nine tools are then absent instead of
+# rejecting activation for the whole profile.
+#
+# Row 1 deliberately carries NO `command` and NO `args`. That row never spawns
+# the MCP server — it resolves the executable itself (config → discovery →
+# adopt → provision) and only needs it for the macOS `turn-ended` cleanup call.
+# Pinning a second copy of the path here is what let the two rows drift apart.
 # ─────────────────────────────────────────────────────────────────────────────
 
 - insert:
     - id: open-computer-use
       name: '@yin1895/dsh-open-computer-use'
       config:
-        # Same native binary as row 2 below; used for the cursor / turn-boundary
-        # calls this row owns.
-        command: 'C:\Users\Administrator\AppData\Local\nvm\v24.21.0\node_modules\open-computer-use\dist\windows\amd64\open-computer-use.exe'
-        args:
-          - mcp
+        # Resolved at runtime: explicit `command` if set, else per-platform
+        # discovery, else adopted/provisioned into <cli-home>. Leave empty.
+        command: ''
         serverName: ocu
         toolCallTimeoutMs: 60000
         enableTurnBoundaryHook: true
         registerSkill: true
         cursorCleanupCommand: ''
+        # Install Open Computer Use into <cli-home> when it is missing anywhere
+        # on the machine. Off means "report and do nothing".
+        autoProvision: true
+        # Empty means `<dsh-home>/ocu` — the same location as the MCP row's
+        # `dshHomePath('ocu/bin/open-computer-use.exe')`.
+        cliHome: ''
         # `env` and `cwd` are optional. Adding either one replaces the whole
         # `config` mapping above, so repeat every field you want to keep.
         # env: {}
@@ -57,7 +93,9 @@
       config:
         serverName: ocu
         transport: stdio
-        command: 'C:\Users\Administrator\AppData\Local\nvm\v24.21.0\node_modules\open-computer-use\dist\windows\amd64\open-computer-use.exe'
+        # Same-source expression: `ocu/bin/open-computer-use.exe` must equal
+        # `SHIPPED_CLI_RELATIVE_COMMAND` in index.js (see the header).
+        command: !!js dshHomePath('ocu/bin/open-computer-use.exe')
         args:
           - mcp
         failOnStartupError: false

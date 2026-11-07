@@ -14,6 +14,15 @@
  *   C. Configuration resolution and diagnostics. `command` is discovered per
  *      platform when it is left empty, `apply()` logs one structured summary,
  *      and `doctor()` reports machine-checkable facts.
+ *   D. `<cli-home>` ownership. The published bundle must not carry any one
+ *      machine's install directory, so `cordis.patch.yml` names the MCP
+ *      executable as `!!js dshHomePath('ocu/bin/open-computer-use.exe')` and
+ *      THIS module is what makes that path real: it adopts an executable that
+ *      already exists on the machine (junction / symlink / copy, source never
+ *      touched) or, failing that, installs one with a local-prefix `npm install`
+ *      into `<cli-home>`. Nothing global is modified and `PATH` is never
+ *      changed. `index.js` and the patch's `dshHomePath(...)` argument are one
+ *      convention in two files; `doctor()` fails loudly if they drift.
  *
  * The nine Computer Use tools themselves are NOT implemented here. They come
  * from the second row this bundle inserts — `@deepseek-ai/dsh-mcp-client` with
@@ -33,18 +42,21 @@
  * Harness installation layout.
  */
 
-import { execFile, execFileSync } from 'node:child_process'
+import { execFile, execFileSync, spawn } from 'node:child_process'
 import {
   accessSync,
   constants as fsConstants,
+  copyFileSync,
   existsSync,
+  mkdirSync,
   readdirSync,
   statSync,
+  symlinkSync,
 } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { homedir } from 'node:os'
-import { dirname, join, isAbsolute } from 'node:path'
+import { basename, dirname, join, isAbsolute, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 /** Stable Loader identity; matches the row id in `cordis.patch.yml`. */
@@ -74,6 +86,8 @@ export const DEFAULT_CONFIG = {
   enableTurnBoundaryHook: true,
   registerSkill: true,
   cursorCleanupCommand: '',
+  autoProvision: true,
+  cliHome: '',
 }
 
 /** Skill identity. Fixed so users find the same name the shell script used. */
@@ -113,15 +127,14 @@ const logPrefix = '[open-computer-use]'
  * ──────────────────────────────────────────────────────────────────────────── */
 
 /** Candidate Harness profile directories, most specific first. */
-function profileDirectories() {
+function profileDirectories(env = process.env) {
   const found = []
   const add = (dir) => {
     if (dir && !found.includes(dir)) found.push(dir)
   }
-  add(process.env.DSH_PROFILE_DIR)
-  const dshHome =
-    process.env.DSH_HOME || join(homedir(), '.dsh')
-  add(process.env.DSH_PROFILE ? join(dshHome, 'profiles', process.env.DSH_PROFILE) : '')
+  add(env.DSH_PROFILE_DIR)
+  const dshHome = dshHomeDir(env)
+  add(env.DSH_PROFILE ? join(dshHome, 'profiles', env.DSH_PROFILE) : '')
   add(join(dshHome, 'profiles', 'desktop'))
   return found
 }
@@ -205,6 +218,8 @@ export const Config = z
       enableTurnBoundaryHook: z.boolean().default(true),
       registerSkill: z.boolean().default(true),
       cursorCleanupCommand: z.string().default(''),
+      autoProvision: z.boolean().default(true),
+      cliHome: z.string().default(''),
     })
   : undefined
 
@@ -278,6 +293,625 @@ export function isReadableFile(path) {
 }
 
 /* ────────────────────────────────────────────────────────────────────────────
+ * D. `<cli-home>` — the plugin-owned executable home
+ *
+ * Read before section C, because C's discovery list starts at this path and
+ * because `apply()` runs adoption and provisioning before anything else.
+ *
+ * ONE CONVENTION, TWO FILES. `cliHomeRelativeCommand()` and
+ * `cliBinRelativeCommand()` are the only places this module spells out where the
+ * executable lives:
+ *
+ *   ocu/bin/open-computer-use.exe      ← the shipped form (Windows)
+ *   ocu/bin/open-computer-use          ← macOS and Linux (no extension)
+ *
+ * `cordis.patch.yml`'s MCP row names the same location as a Loader expression,
+ * `!!js dshHomePath('ocu/bin/open-computer-use.exe')`. The string inside
+ * `dshHomePath(...)` must equal `SHIPPED_CLI_RELATIVE_COMMAND` below; change one
+ * and you must change the other (`doctor()`'s `cli-home-patch-parity` check
+ * compares the two literally, and the self-check asserts it mechanically).
+ *
+ * WHY THE SHIPPED FORM IS THE WINDOWS ONE. Windows is the only platform where
+ * the native binary carries `.exe`, and `dshHomePath()` takes a literal, so the
+ * shipped argument cannot branch on the platform. The plugin therefore
+ * materialises BOTH names on macOS and Linux: the platform-native one, plus a
+ * link under the shipped `.exe` name, so the shipped expression resolves
+ * everywhere instead of silently resolving to nothing.
+ *
+ * WHY `<dsh-home>` AND NOT A BARE PATH. `dshHomePath()` is the Harness' own
+ * Loader helper (`@deepseek-ai/dsh-home-paths`, provided on the root context as
+ * `dshHomePath`; shipped rows such as `session-persistence-jsonl` use it for
+ * `sessions`). Expressing the executable's location the same way is what keeps
+ * the artifact machine-independent: `<dsh-home>` is a property of the reader's
+ * installation, not of the author's.
+ *
+ * WRITE DISCIPLINE. Every function below writes only inside `<cli-home>`. An
+ * existing install elsewhere on the machine is READ, never moved, renamed or
+ * modified: adopt means "point at it", and the worst case is a copy that leaves
+ * the source untouched.
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+/** `<cli-home>` directory name below the DSH home: `<dsh-home>/ocu`. */
+export const CLI_HOME_SEGMENT = 'ocu'
+
+/** Directory inside `<cli-home>` that holds the executable. */
+export const CLI_BIN_DIR = 'bin'
+
+/** Executable stem, without a platform extension. */
+export const CLI_BASENAME = 'open-computer-use'
+
+/** Windows executable extension; the only platform that has one. */
+export const CLI_WINDOWS_EXTENSION = '.exe'
+
+/**
+ * The `<cli-home>`-relative executable path for one platform, always in POSIX
+ * form: `bin/open-computer-use.exe` (Windows) or `bin/open-computer-use`.
+ *
+ * This is the single definition of the layout below `<cli-home>`:
+ * `expectedCliPath()` derives from it.
+ */
+export function cliBinRelativeCommand(platform = process.platform) {
+  const extension = platform === 'win32' ? CLI_WINDOWS_EXTENSION : ''
+  return [CLI_BIN_DIR, `${CLI_BASENAME}${extension}`].join('/')
+}
+
+/**
+ * The `<dsh-home>`-relative executable path for one platform, always in POSIX
+ * form: `ocu/bin/open-computer-use.exe`.
+ *
+ * This is the string that belongs in `dshHomePath('...')`, and it is the single
+ * definition of the layout below the DSH home: `SHIPPED_CLI_RELATIVE_COMMAND`
+ * and `shippedCliPath()` derive from it.
+ *
+ * @param {NodeJS.Platform|string} [platform]
+ * @returns {string} e.g. `ocu/bin/open-computer-use.exe`
+ */
+export function cliHomeRelativeCommand(platform = process.platform) {
+  return [CLI_HOME_SEGMENT, cliBinRelativeCommand(platform)].join('/')
+}
+
+/**
+ * The `<dsh-home>`-relative path the published `cordis.patch.yml` pins, i.e. the
+ * exact argument of `dshHomePath(...)` in the MCP row. Must stay equal to that
+ * literal — see the section banner.
+ */
+export const SHIPPED_CLI_RELATIVE_COMMAND = cliHomeRelativeCommand('win32')
+
+/** `true` when two paths name the same location. Separators and Windows case. */
+export function isSamePath(left, right, platform = process.platform) {
+  if (typeof left !== 'string' || typeof right !== 'string' || left.length === 0 || right.length === 0) return false
+  const normalise = (value) => {
+    const trimmed = resolve(value).replace(/[\\/]+$/, '')
+    return platform === 'win32' ? trimmed.toLowerCase() : trimmed
+  }
+  return normalise(left) === normalise(right)
+}
+
+/**
+ * The DSH home: `DSH_HOME` when set, else `~/.dsh`. Mirrors what the Harness'
+ * own `resolveDshHome()` does for a default installation.
+ *
+ * @param {Record<string, string|undefined>} [env]
+ * @returns {string} absolute
+ */
+export function dshHomeDir(env = process.env) {
+  const configured = typeof env?.DSH_HOME === 'string' ? env.DSH_HOME.trim() : ''
+  return configured.length > 0 ? resolve(configured) : join(homedir(), '.dsh')
+}
+
+/**
+ * The plugin-owned executable home: the configured `cliHome`, else
+ * `<dsh-home>/ocu`. This is the directory both `dshHomePath(...)` arguments and
+ * every write in this section are relative to.
+ *
+ * @param {{ cliHome?: string, env?: Record<string, string|undefined> }} [options]
+ * @returns {string} absolute
+ */
+export function cliHomeDir({ cliHome = '', env = process.env } = {}) {
+  const configured = typeof cliHome === 'string' ? cliHome.trim() : ''
+  return configured.length > 0 ? resolve(configured) : join(dshHomeDir(env), CLI_HOME_SEGMENT)
+}
+
+/** `<cli-home>/bin`. */
+export function cliBinDir({ cliHome = '', env = process.env } = {}) {
+  return join(cliHomeDir({ cliHome, env }), CLI_BIN_DIR)
+}
+
+/**
+ * `<cli-home>/<cliBinRelativeCommand(platform)>` — the platform-native path.
+ *
+ * With the default `cliHome` this is `<dsh-home>/ocu/bin/open-computer-use.exe`,
+ * i.e. exactly what the MCP row's `dshHomePath('ocu/bin/open-computer-use.exe')`
+ * resolves to on Windows.
+ *
+ * @returns {string} absolute
+ */
+export function expectedCliPath({ cliHome = '', env = process.env, platform = process.platform } = {}) {
+  return join(cliHomeDir({ cliHome, env }), ...cliBinRelativeCommand(platform).split('/'))
+}
+
+/**
+ * The exact path the MCP row's `!!js dshHomePath(...)` expression resolves to:
+ * always `<dsh-home>/ocu/bin/open-computer-use.exe`, because `dshHomePath()`
+ * takes a literal and knows nothing about the `cliHome` config field.
+ *
+ * Equal to `expectedCliPath()` when `cliHome` is left at its default and the
+ * platform is Windows. When it differs — a non-Windows extension, or an explicit
+ * `cliHome` — the plugin links this path to the executable it adopted or
+ * provisioned, so the MCP row still resolves.
+ *
+ * @returns {string} absolute
+ */
+export function shippedCliPath({ env = process.env } = {}) {
+  return join(dshHomeDir(env), ...SHIPPED_CLI_RELATIVE_COMMAND.split('/'))
+}
+
+/** `true` when `directory` exists and holds nothing. */
+function isEmptyDirectory(directory) {
+  try {
+    return readdirSync(directory).length === 0
+  } catch {
+    return false
+  }
+}
+
+/** Junction (Windows) or directory symlink (else): needs no privilege on Windows. */
+function tryLinkDirectory(linkPath, target) {
+  try {
+    mkdirSync(dirname(linkPath), { recursive: true })
+    symlinkSync(target, linkPath, process.platform === 'win32' ? 'junction' : 'dir')
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** File symlink. Needs developer mode / elevation on Windows, so failure is normal. */
+function tryLinkFile(linkPath, target) {
+  try {
+    mkdirSync(dirname(linkPath), { recursive: true })
+    symlinkSync(target, linkPath, 'file')
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** Last-resort copy. Reads the source, writes only the destination. */
+function tryCopyFile(targetPath, source) {
+  try {
+    mkdirSync(dirname(targetPath), { recursive: true })
+    copyFileSync(source, targetPath)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Put the executable at `target` by pointing at `source`.
+ *
+ * Three escalating strategies, cheapest first:
+ *
+ *   1. **Directory link** — link `dirname(target)`, not the file. Only usable
+ *      when `source` already sits under the name we need (true for a Windows
+ *      global npm install). This is the only form that also follows a later
+ *      upgrade of the source install, which is why it is tried first.
+ *   2. **File link** — no extra disk, still follows the source. On Windows this
+ *      needs developer mode, so a failure here is expected.
+ *   3. **Copy** — self-contained and always available, but pinned to the version
+ *      copied. Re-running `apply()` after an upgrade re-copies only if the
+ *      target is missing.
+ *
+ * @returns {{ ok: boolean, action: string, target: string, source?: string, detail?: string }}
+ */
+function materializeCli({ cliHome = '', env = process.env, target, source }) {
+  if (existsSync(target)) return { ok: true, action: 'present', target }
+  if (!isExecutableFile(source)) return { ok: false, action: 'missing-source', target, source: source ?? '' }
+
+  const home = cliHomeDir({ cliHome, env })
+  try {
+    mkdirSync(home, { recursive: true })
+  } catch (cause) {
+    return { ok: false, action: 'failed', target, source, detail: `cannot create ${home}: ${describeError(cause)}` }
+  }
+
+  const linkRoot = dirname(target)
+  if (basename(source) === basename(target) && !existsSync(linkRoot) && tryLinkDirectory(linkRoot, dirname(source))) {
+    return existsSync(target)
+      ? { ok: true, action: 'linked-directory', target, source }
+      : { ok: false, action: 'failed', target, source, detail: `linked ${linkRoot} but ${target} is still missing` }
+  }
+  if (tryLinkFile(target, source)) return { ok: true, action: 'linked-file', target, source }
+  if (tryCopyFile(target, source)) return { ok: true, action: 'copied', target, source }
+  return { ok: false, action: 'failed', target, source, detail: `could not link or copy ${source}` }
+}
+
+/**
+ * Make the shipped `dshHomePath(...)` argument resolve on this platform.
+ *
+ * On Windows the native path IS the shipped path, so this is a no-op. On macOS
+ * and Linux the native binary has no extension, so a link under the shipped
+ * `.exe` name is added; without it the MCP row's expression would resolve to a
+ * missing file and the nine tools would be absent with no error.
+ */
+function ensureShippedAlias({ cliHome = '', env = process.env, platform = process.platform, source }) {
+  const shipped = shippedCliPath({ env })
+  if (isSamePath(shipped, source, platform)) return { path: shipped, action: 'same-as-native' }
+  if (existsSync(shipped)) return { path: shipped, action: 'present' }
+  if (tryLinkFile(shipped, source)) return { path: shipped, action: 'linked-file' }
+  if (tryCopyFile(shipped, source)) return { path: shipped, action: 'copied' }
+  return { path: shipped, action: 'failed' }
+}
+
+/**
+ * Adopt an existing Open Computer Use install into `<cli-home>`.
+ *
+ * Reads `candidates` (the same per-platform discovery list `apply()` uses) and
+ * writes only inside `<cli-home>`. The source install is never modified, moved
+ * or deleted: this is "point at it", not "take it".
+ *
+ * Never throws.
+ *
+ * @returns {{
+ *   action: 'none'|'linked-directory'|'linked-file'|'copied'|'no-source'|'missing-source'|'failed',
+ *   expected: string, source: string, shipped?: object, detail: string,
+ * }}
+ */
+export function adoptExistingCli({
+  cliHome = '',
+  env = process.env,
+  platform = process.platform,
+  arch = process.arch,
+  logger,
+  candidates = candidateCommands({ platform, arch, env, cliHome }),
+} = {}) {
+  const context = { cliHome, env, platform }
+  const expected = expectedCliPath(context)
+
+  if (existsSync(expected)) {
+    const shipped = ensureShippedAlias({ ...context, source: expected })
+    return { action: 'none', expected, source: expected, shipped, detail: 'already present; nothing to do' }
+  }
+
+  const source = candidates.find(
+    (candidate) => isExecutableFile(candidate) && !isSamePath(candidate, expected, platform),
+  )
+  if (!source) {
+    return {
+      action: 'no-source',
+      expected,
+      source: '',
+      detail: `no Open Computer Use executable among ${candidates.length} candidate paths`,
+    }
+  }
+
+  const result = materializeCli({ ...context, target: expected, source })
+  if (!result.ok) {
+    logger?.warn?.(`could not place a CLI at ${expected} from ${source}: ${result.detail ?? result.action}`)
+    return { action: 'failed', expected, source, detail: result.detail ?? result.action }
+  }
+  const shipped = ensureShippedAlias({ ...context, source: expected })
+  logger?.info?.(`adopted the existing install at ${source} -> ${expected} (${result.action})`)
+  return { action: result.action, expected, source, shipped, detail: `${result.action} from ${source}` }
+}
+
+/* ── provisioning: last resort, off the activation path ─────────────────── */
+
+/** cmd.exe / sh metacharacters that make a shell fallback unsafe. */
+const SHELL_UNSAFE = /["'`$&|<>^%\r\n\t]/
+
+/**
+ * How to run npm on this machine — resolved WITHOUT relying on PATH and WITHOUT
+ * a shell when a real Node entry point exists.
+ *
+ * Measured on this machine: `npm` and `pnpm` resolve to `.ps1` shims and `node`
+ * to a real `.exe`. A `.cmd`/`.ps1` shim cannot be spawned directly
+ * (EINVAL / EFTYPE), so a naive `spawn('npm', …)` fails outright. Preference
+ * order:
+ *
+ *   1. `process.execPath` + npm's own `bin/npm-cli.js` — an absolute `.exe` with
+ *      an argument array. No shell, no PATH, no quoting rules. This is the
+ *      primary path.
+ *   2. `cmd.exe /d /s /c npm …` (Windows) or `/bin/sh -c npm …` — only when no
+ *      npm CLI entry can be found. `cmd.exe` resolves `npm.cmd` itself, so this
+ *      still does not depend on the caller's PATH containing npm's directory.
+ *      Refused when the prefix contains characters the shell would interpret.
+ *
+ * @returns {{ command: string, args: string[], via: string, verbatim?: boolean, reason?: string }}
+ */
+export function resolveNpmInvocation({
+  env = process.env,
+  platform = process.platform,
+  execPath = process.execPath,
+  prefix = '',
+} = {}) {
+  const roots = []
+  const addRoot = (directory) => {
+    if (typeof directory === 'string' && directory.length > 0 && !roots.includes(directory)) roots.push(directory)
+  }
+  addRoot(dirname(execPath))
+  addRoot(readEnv(env, 'NVM_SYMLINK'))
+  addRoot(readEnv(env, 'NVM_HOME'))
+  const programFiles = readEnv(env, 'ProgramFiles')
+  if (programFiles) addRoot(join(programFiles, 'nodejs'))
+
+  const cliEntries = []
+  for (const root of roots) {
+    cliEntries.push(join(root, 'node_modules', 'npm', 'bin', 'npm-cli.js'))
+    cliEntries.push(join(root, 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js'))
+  }
+  const cli = cliEntries.find((candidate) => existsSync(candidate))
+  const npmArgs = ['install', '--prefix', prefix, '--no-save', '--no-fund', '--no-audit', 'open-computer-use']
+  if (cli) {
+    return { command: execPath, args: [cli, ...npmArgs], via: `node + npm-cli.js (${cli})` }
+  }
+
+  if (SHELL_UNSAFE.test(prefix)) {
+    return {
+      command: '',
+      args: [],
+      via: 'unavailable',
+      reason: `no npm-cli.js found and the shell fallback is unsafe for a prefix containing shell metacharacters: ${prefix}`,
+    }
+  }
+  if (platform === 'win32') {
+    const comspec = readEnv(env, 'ComSpec') || join(readEnv(env, 'SystemRoot') ?? 'C:\\Windows', 'System32', 'cmd.exe')
+    return {
+      command: comspec,
+      args: ['/d', '/s', '/c', `npm install --prefix "${prefix}" --no-save --no-fund --no-audit open-computer-use`],
+      via: 'cmd.exe /c npm (shim fallback)',
+      verbatim: true,
+    }
+  }
+  return {
+    command: '/bin/sh',
+    args: ['-c', `npm install --prefix '${prefix}' --no-save --no-fund --no-audit open-computer-use`],
+    via: 'sh -c npm (shim fallback)',
+  }
+}
+
+/**
+ * Install Open Computer Use into `<cli-home>` with a LOCAL prefix.
+ *
+ * `npm install --prefix <cli-home> open-computer-use` writes
+ * `<cli-home>/node_modules/...` and nothing else: no global prefix, no `PATH`
+ * entry, no elevation. After a successful install the package's own layout is
+ * adopted into `<cli-home>/bin` like any other existing install.
+ *
+ * Never rejects and never throws: every outcome is reported as data, so a failed
+ * install can only produce a `logger.warn` with an actionable command.
+ *
+ * @param {{ spawnProcess?: typeof spawn }} [options] `spawnProcess` is a test
+ *   seam: the self-check passes a stub so no real `npm` and no network is used.
+ * @returns {Promise<{ ok: boolean, action: string, expected: string, invocation: object, detail: string }>}
+ */
+export function provisionCli({
+  cliHome = '',
+  env = process.env,
+  platform = process.platform,
+  arch = process.arch,
+  logger,
+  spawnProcess = spawn,
+  timeoutMs = 180000,
+} = {}) {
+  const home = cliHomeDir({ cliHome, env })
+  const expected = expectedCliPath({ cliHome, env, platform })
+  const invocation = resolveNpmInvocation({ env, platform, prefix: home })
+  const manual = `npm install --prefix "${home}" open-computer-use`
+  const guidance = `install it yourself with \`${manual}\` (or \`npm i -g open-computer-use\`), then restart the Harness`
+
+  return new Promise((resolveOutcome) => {
+    let settled = false
+    const settle = (value) => {
+      if (settled) return
+      settled = true
+      resolveOutcome({ ok: Boolean(value.ok), home, expected, invocation, ...value })
+    }
+
+    if (typeof invocation.command !== 'string' || invocation.command.length === 0) {
+      logger?.warn?.(`cannot auto-install Open Computer Use: ${invocation.reason}; ${guidance}`)
+      settle({ ok: false, action: 'unavailable', detail: invocation.reason })
+      return
+    }
+    if (existsSync(expected)) {
+      settle({ ok: true, action: 'present', detail: `${expected} already exists` })
+      return
+    }
+
+    let child
+    try {
+      mkdirSync(home, { recursive: true })
+      child = spawnProcess(invocation.command, invocation.args, {
+        cwd: home,
+        env,
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        ...(invocation.verbatim ? { windowsVerbatimArguments: true } : {}),
+      })
+    } catch (cause) {
+      logger?.warn?.(`cannot start \`${invocation.via}\` to install Open Computer Use: ${describeError(cause)}; ${guidance}`)
+      settle({ ok: false, action: 'spawn-failed', detail: describeError(cause) })
+      return
+    }
+
+    let stdout = ''
+    let stderr = ''
+    const collect = (chunk, sink) => {
+      const text = String(chunk)
+      const next = sink === 'out' ? stdout + text : stderr + text
+      const trimmed = next.length > 4096 ? next.slice(-4096) : next
+      if (sink === 'out') stdout = trimmed
+      else stderr = trimmed
+    }
+    child.stdout?.on?.('data', (chunk) => collect(chunk, 'out'))
+    child.stderr?.on?.('data', (chunk) => collect(chunk, 'err'))
+
+    let timedOut = false
+    const timer = setTimeout(() => {
+      timedOut = true
+      try {
+        child.kill()
+      } catch {
+        /* the close handler still reports the outcome */
+      }
+    }, timeoutMs)
+    timer.unref?.()
+
+    const finish = (code, error) => {
+      clearTimeout(timer)
+      if (timedOut) {
+        logger?.warn?.(`installing Open Computer Use timed out after ${timeoutMs}ms; ${guidance}`)
+        settle({ ok: false, action: 'timeout', detail: truncate(stderr || stdout, 300) })
+        return
+      }
+      if (error || code !== 0) {
+        logger?.warn?.(
+          `installing Open Computer Use failed (exit=${code ?? 'null'}): ${truncate(stderr || stdout || describeError(error), 300)}; ${guidance}`,
+        )
+        settle({ ok: false, action: 'install-failed', detail: truncate(stderr || stdout, 300) })
+        return
+      }
+      // npm writes `<cli-home>/node_modules/open-computer-use/dist/<platform>/…`;
+      // adopt it into `<cli-home>/bin` exactly like a pre-existing install.
+      const adopted = adoptExistingCli({
+        cliHome,
+        env,
+        platform,
+        arch,
+        logger,
+        candidates: npmRootCandidates(join(home, 'node_modules'), arch),
+      })
+      if (adopted.action === 'no-source' || adopted.action === 'failed') {
+        logger?.warn?.(
+          `Open Computer Use was installed into ${home} but no executable was found under ${join(home, 'node_modules')} (${adopted.detail}); check \`${invocation.via}\` output and ${guidance}`,
+        )
+        settle({ ok: false, action: 'installed-without-executable', detail: adopted.detail })
+        return
+      }
+      logger?.info?.(`provisioned Open Computer Use into ${home} (${invocation.via}): ${expected}`)
+      settle({ ok: true, action: `provisioned:${adopted.action}`, detail: `${invocation.via} -> ${expected}` })
+    }
+
+    child.once?.('error', (error) => finish(null, error))
+    child.once?.('close', (code) => finish(code, undefined))
+  })
+}
+
+/* ── profile-patch conflict detection (read-only, never repairs) ─────────── */
+
+/** Begin marker written by `scripts/install-dsh-mcp.sh` into a profile patch. */
+export const MANAGED_BLOCK_BEGIN = '# >>> open-computer-use (managed by install-dsh-mcp.sh)'
+
+/** End marker written by the same script. */
+export const MANAGED_BLOCK_END = '# <<< open-computer-use'
+
+const DSH_HOME_PATH_CALL = /dshHomePath\(\s*(['"])([\w./\\:-]+)\1\s*\)/
+
+/**
+ * Every `dshHomePath('...')` argument in a patch document, in source order.
+ *
+ * Comments are stripped first: this module's own patch documents the convention
+ * in prose, and a commented-out example must not look like a second, conflicting
+ * argument.
+ */
+export function extractDshHomePathArguments(text) {
+  const found = []
+  for (const rawLine of String(text).split(/\r?\n/)) {
+    const line = rawLine.trim().startsWith('#') ? '' : rawLine.replace(/\s+#.*$/, '')
+    if (line.length === 0) continue
+    const match = DSH_HOME_PATH_CALL.exec(line)
+    if (match) found.push(match[2])
+  }
+  return found
+}
+
+/** The nearest `- id: <name>` above `index`, so a conflict can name its row. */
+function nearestRowId(lines, index) {
+  for (let cursor = index; cursor >= 0; cursor -= 1) {
+    const match = /^\s*-\s*id\s*:\s*['"]?([^'"\s]+)['"]?\s*$/.exec(lines[cursor])
+    if (match) return match[1]
+  }
+  return undefined
+}
+
+/**
+ * Find the two ways a profile patch collides with this bundle, without changing
+ * anything:
+ *
+ *   1. `managed-block` — the block `scripts/install-dsh-mcp.sh` writes. It owns
+ *      the same `@deepseek-ai/dsh-mcp-client` row, so leaving it in place means
+ *      two rows named `ocu` and two sets of nine tools.
+ *   2. `duplicate-serverName` — any other `serverName: ocu` row, including a
+ *      stale hand-written one. Commented-out lines are ignored.
+ *
+ * Repair is deliberately out of scope: `doctor()` reports and prints the command
+ * the user should run. Automatically rewriting somebody's patch layer is how a
+ * read-only diagnosis turns into data loss.
+ *
+ * @returns {{ kind: string, line: number, rowId?: string, detail: string, endLine?: number }[]}
+ */
+export function scanPatchConflicts(text) {
+  const lines = String(text).split(/\r?\n/)
+  const conflicts = []
+  let blockStart = -1
+
+  lines.forEach((line, index) => {
+    const trimmed = line.trim()
+    if (trimmed.startsWith(MANAGED_BLOCK_BEGIN)) {
+      blockStart = index + 1
+      return
+    }
+    if (trimmed.startsWith(MANAGED_BLOCK_END) && blockStart >= 0) {
+      conflicts.push({
+        kind: 'managed-block',
+        line: blockStart,
+        endLine: index + 1,
+        detail: MANAGED_BLOCK_BEGIN,
+      })
+      blockStart = -1
+      return
+    }
+    if (trimmed.startsWith('#')) return
+    const match = /^serverName\s*:\s*['"]?ocu['"]?\s*(?:#.*)?$/.exec(trimmed)
+    if (match) {
+      conflicts.push({
+        kind: 'duplicate-serverName',
+        line: index + 1,
+        rowId: nearestRowId(lines, index),
+        detail: trimmed,
+      })
+    }
+  })
+
+  if (blockStart >= 0) {
+    conflicts.push({
+      kind: 'managed-block',
+      line: blockStart,
+      endLine: lines.length,
+      detail: `${MANAGED_BLOCK_BEGIN} (no closing marker found)`,
+    })
+  }
+  return conflicts
+}
+
+/**
+ * The exact commands the user should run themselves. Printed, never executed.
+ *
+ * @returns {string[]}
+ */
+export function conflictCleanupCommands(conflicts, patchPath) {
+  const target = patchPath || '<profile>/cordis.patch.yml'
+  return conflicts.map((conflict) => {
+    if (conflict.kind === 'managed-block') {
+      return `delete lines ${conflict.line}-${conflict.endLine} of ${target} (the ${MANAGED_BLOCK_BEGIN} block): pwsh -NoProfile -Command "$p='${target}'; $l=Get-Content $p; ($l[0..${conflict.line - 2}] + $l[${conflict.endLine}..($l.Count - 1)]) | Set-Content $p"`
+    }
+    const row = conflict.rowId ? `'${conflict.rowId}'` : 'the row at that line'
+    return `remove ${row} (line ${conflict.line}) from ${target}, or set \`disabled: true\` on it`
+  })
+}
+
+/* ────────────────────────────────────────────────────────────────────────────
  * C. Executable discovery
  * ──────────────────────────────────────────────────────────────────────────── */
 
@@ -286,20 +920,36 @@ function distArch(arch) {
   return arch === 'x64' ? 'amd64' : arch
 }
 
-/** Every `<localappdata>/nvm/<version>` directory, newest name first. */
+/**
+ * Every `<nvm-root>/<version>` directory, newest name first.
+ *
+ * Two roots are scanned because the two mainstream Windows nvm ports disagree:
+ * `nvm-windows` keeps versions under `%LOCALAPPDATA%\nvm`, while `nvm4w` keeps
+ * them under `%NVM_HOME%`. Either can hold the `node_modules` an `npm i -g`
+ * install produced.
+ */
 function nvmVersionDirectories(env) {
-  const localAppData = readEnv(env, 'LOCALAPPDATA')
-  if (!localAppData) return []
-  const nvm = join(localAppData, 'nvm')
-  try {
-    return readdirSync(nvm, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory())
-      .map((entry) => join(nvm, entry.name))
-      .sort()
-      .reverse()
-  } catch {
-    return []
+  const roots = []
+  const addRoot = (directory) => {
+    if (directory && !roots.includes(directory)) roots.push(directory)
   }
+  const localAppData = readEnv(env, 'LOCALAPPDATA')
+  addRoot(localAppData ? join(localAppData, 'nvm') : '')
+  addRoot(readEnv(env, 'NVM_HOME'))
+
+  const directories = []
+  for (const root of roots) {
+    try {
+      for (const entry of readdirSync(root, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue
+        const candidate = join(root, entry.name)
+        if (!directories.includes(candidate)) directories.push(candidate)
+      }
+    } catch {
+      /* a missing nvm root is the normal case, not an error */
+    }
+  }
+  return directories.sort().reverse()
 }
 
 /** The `node_modules` directory that sits next to the running Node binary. */
@@ -316,10 +966,35 @@ function openComputerUseRelative(platform, arch, tail) {
 }
 
 /**
+ * The four places an `open-computer-use` package can put its executable below
+ * one `node_modules` root: the Windows dist, the two POSIX dists, and the macOS
+ * app bundle. Shared by the global root (`npm root -g`) and by the local prefix
+ * `<cli-home>/node_modules` right after a provision.
+ *
+ * @returns {string[]} absolute, de-duplicated
+ */
+export function npmRootCandidates(root, arch = process.arch) {
+  if (typeof root !== 'string' || root.length === 0) return []
+  return [
+    join(root, ...openComputerUseRelative('windows', arch, ['open-computer-use.exe'])),
+    join(root, ...openComputerUseRelative('darwin', arch, ['open-computer-use'])),
+    join(root, ...openComputerUseRelative('linux', arch, ['open-computer-use'])),
+    join(root, 'open-computer-use', 'dist', 'darwin', 'Open Computer Use.app', 'Contents', 'MacOS', 'OpenComputerUse'),
+  ].filter((candidate, index, all) => isAbsolute(candidate) && all.indexOf(candidate) === index)
+}
+
+/**
  * Cheap, filesystem-only candidates. No process is started from here.
+ *
+ * The first candidate is always the plugin-owned home, because that is the
+ * location both `cordis.patch.yml` rows agree on and the only place this plugin
+ * writes. Everything after it is "some install that already exists on this
+ * machine", which adopt can point at.
+ *
+ * @param {{ platform?: string, arch?: string, env?: object, cliHome?: string }} [options]
  * @returns {string[]} absolute candidate paths, most likely first
  */
-export function candidateCommands({ platform = process.platform, arch = process.arch, env = process.env } = {}) {
+export function candidateCommands({ platform = process.platform, arch = process.arch, env = process.env, cliHome = '' } = {}) {
   const found = []
   const add = (...segments) => {
     if (segments.some((segment) => !segment)) return
@@ -327,15 +1002,19 @@ export function candidateCommands({ platform = process.platform, arch = process.
     if (isAbsolute(candidate) && !found.includes(candidate)) found.push(candidate)
   }
 
+  /* 1. `<cli-home>` — where the MCP row's `dshHomePath(...)` expression looks. */
+  add(expectedCliPath({ cliHome, env, platform }))
+
   const beside = nodeModulesBesideNode()
   if (platform === 'win32') {
     const winTail = ['open-computer-use.exe']
-    add(beside, ...openComputerUseRelative('windows', 'amd64', winTail))
+    add(beside, ...openComputerUseRelative('windows', arch, winTail))
     for (const version of nvmVersionDirectories(env)) {
-      add(version, 'node_modules', ...openComputerUseRelative('windows', 'amd64', winTail))
+      add(version, 'node_modules', ...openComputerUseRelative('windows', arch, winTail))
     }
-    add(readEnv(env, 'APPDATA'), 'npm', 'node_modules', ...openComputerUseRelative('windows', 'amd64', winTail))
-    add(readEnv(env, 'ProgramFiles'), 'nodejs', 'node_modules', ...openComputerUseRelative('windows', 'amd64', winTail))
+    add(readEnv(env, 'NVM_SYMLINK'), 'node_modules', ...openComputerUseRelative('windows', arch, winTail))
+    add(readEnv(env, 'APPDATA'), 'npm', 'node_modules', ...openComputerUseRelative('windows', arch, winTail))
+    add(readEnv(env, 'ProgramFiles'), 'nodejs', 'node_modules', ...openComputerUseRelative('windows', arch, winTail))
   } else if (platform === 'darwin') {
     add(homedir(), 'Applications', 'Open Computer Use.app', 'Contents', 'MacOS', 'OpenComputerUse')
     add('/Applications', 'Open Computer Use.app', 'Contents', 'MacOS', 'OpenComputerUse')
@@ -363,16 +1042,35 @@ function npmGlobalRoot(platform = process.platform) {
 }
 
 /**
- * Resolve the native executable: explicit configuration first, then per-platform
- * discovery. Never throws; a miss returns the candidate list for diagnostics.
+ * Resolve the native executable: explicit configuration first, then the
+ * plugin-owned `<cli-home>` path, then per-platform discovery. Never throws; a
+ * miss returns the candidate list for diagnostics.
+ *
+ * `source` tells the caller where the answer came from:
+ *
+ *   `config`     — an explicit `command` was set on the row.
+ *   `cli-home`   — the plugin-owned path exists (adopt or a previous provision).
+ *   `discovered` — some other install on this machine.
+ *   `not-found`  — nothing; `apply()` decides whether to provision.
+ *
+ * `candidates` replaces the whole search list, including the `npm root -g`
+ * fallback, so "look exactly here" is expressible. It exists so verification can
+ * run against a temporary directory instead of the machine's real installs.
  */
 export function discoverCommand({
   command = '',
   platform = process.platform,
   arch = process.arch,
   env = process.env,
+  cliHome = '',
+  candidates: overrideCandidates,
 } = {}) {
-  const candidates = candidateCommands({ platform, arch, env })
+  const expected = expectedCliPath({ cliHome, env, platform })
+  const overridden = Array.isArray(overrideCandidates)
+  const candidates = overridden
+    ? overrideCandidates.filter((candidate) => typeof candidate === 'string' && isAbsolute(candidate))
+    : candidateCommands({ platform, arch, env, cliHome })
+  const labelFor = (candidate) => (isSamePath(candidate, expected, platform) ? 'cli-home' : 'discovered')
 
   if (typeof command === 'string' && command.trim().length > 0) {
     const configured = command.trim()
@@ -381,37 +1079,34 @@ export function discoverCommand({
       found: isExecutableFile(configured),
       source: 'config',
       candidates,
+      expected,
     }
   }
 
   for (const candidate of candidates) {
-    if (isExecutableFile(candidate)) return { command: candidate, found: true, source: 'discovered', candidates }
+    if (isExecutableFile(candidate)) {
+      return { command: candidate, found: true, source: labelFor(candidate), candidates, expected }
+    }
   }
 
-  const npmRoot = npmGlobalRoot(platform)
+  const npmRoot = overridden ? undefined : npmGlobalRoot(platform)
   if (npmRoot) {
-    const tail =
-      platform === 'win32'
-        ? ['open-computer-use.exe']
-        : ['open-computer-use']
-    const npmCandidates = [
-      join(npmRoot, ...openComputerUseRelative('windows', 'amd64', tail)),
-      join(npmRoot, ...openComputerUseRelative('darwin', arch, tail)),
-      join(npmRoot, ...openComputerUseRelative('linux', arch, tail)),
-      join(npmRoot, 'open-computer-use', 'dist', 'darwin', 'Open Computer Use.app', 'Contents', 'MacOS', 'OpenComputerUse'),
-    ].filter(
-      (candidate, index, all) =>
-        isAbsolute(candidate) && all.indexOf(candidate) === index,
-    )
+    const npmCandidates = npmRootCandidates(npmRoot, arch)
     for (const candidate of npmCandidates) {
       if (isExecutableFile(candidate)) {
-        return { command: candidate, found: true, source: `npm-root:${npmRoot}`, candidates: [...candidates, ...npmCandidates] }
+        return {
+          command: candidate,
+          found: true,
+          source: labelFor(candidate),
+          candidates: [...candidates, ...npmCandidates],
+          expected,
+        }
       }
     }
-    return { command: undefined, found: false, source: 'not-found', candidates: [...candidates, ...npmCandidates] }
+    return { command: undefined, found: false, source: 'not-found', candidates: [...candidates, ...npmCandidates], expected }
   }
 
-  return { command: undefined, found: false, source: 'not-found', candidates }
+  return { command: undefined, found: false, source: 'not-found', candidates, expected }
 }
 
 /* ────────────────────────────────────────────────────────────────────────────
@@ -716,16 +1411,50 @@ export function resolveConfig(config) {
 }
 
 /**
+ * Normalise a raw discovery source into the four labels the activation summary
+ * uses, so a reader can see *how* the executable was decided:
+ *
+ *   `config`    — the row's `command` was set explicitly.
+ *   `adopt`     — an install already on the machine was pointed at from
+ *                 `<cli-home>` (or was already there).
+ *   `discovery` — an install elsewhere on the machine is used as-is.
+ *   `provision` — nothing existed, so the plugin installed one.
+ */
+export function normalizeCommandSource(discoverySource, { adopted, provisioning } = {}) {
+  if (discoverySource === 'config') return 'config'
+  if (discoverySource === 'cli-home') return 'adopt'
+  if (discoverySource === 'discovered') return 'discovery'
+  if (provisioning) return 'provision'
+  return discoverySource === 'not-found' ? 'not-found' : 'discovery'
+}
+
+/**
  * Host half entry point.
  *
  * Everything is registered inside `ctx.effect` / `ctx.on`, so disposing the row
  * removes the listener and unregisters the skill.
+ *
+ * `<cli-home>` adoption runs FIRST and the optional install is started before
+ * anything else, so a machine that has never seen Open Computer Use is already
+ * being fixed while the rest of the row wires itself up. Neither step can block
+ * or fail activation: adopt is synchronous and wrapped in `try`/`catch`, and the
+ * install is a promise whose every outcome — including a rejection — becomes a
+ * log line.
+ *
+ * @param {object} [deps] Test seam, unused by the Harness:
+ *   `{ spawnProcess, candidates }` replaces `node:child_process.spawn` for the
+ *   (otherwise real) `npm install`, and narrows the executable search to an
+ *   explicit path list, so the self-check never touches the network or the
+ *   machine's real installs.
  */
-export function apply(ctx, config) {
+export function apply(ctx, config, deps = {}) {
   const options = resolveConfig(config)
   const logger = createLogger(ctx)
   const platform = process.platform
+  const arch = process.arch
+  const env = process.env
   const toolPrefix = `mcp__${options.serverName}__`
+  const searchCandidates = Array.isArray(deps?.candidates) ? deps.candidates : undefined
 
   if (!Config) {
     logger.warn(
@@ -733,14 +1462,84 @@ export function apply(ctx, config) {
     )
   }
 
+  /* ── D. <cli-home>: adopt, then optionally provision ─────────────────────── */
+  const configuredCommand = typeof options.command === 'string' ? options.command.trim() : ''
+  const cliHome = {
+    dir: cliHomeDir({ cliHome: options.cliHome, env }),
+    expected: expectedCliPath({ cliHome: options.cliHome, env, platform }),
+    shipped: shippedCliPath({ env }),
+    adopt: { action: 'skipped', source: '', detail: 'not attempted' },
+    provision: 'not attempted',
+  }
+  if (configuredCommand.length > 0) {
+    cliHome.adopt = { action: 'skipped', source: '', detail: 'the row sets `command` explicitly, so <cli-home> is left alone' }
+  } else {
+    try {
+      cliHome.adopt = adoptExistingCli({ cliHome: options.cliHome, env, platform, arch, logger, candidates: searchCandidates })
+      logger.info(
+        `<cli-home> ${cliHome.dir} expected=${cliHome.expected} shipped=${cliHome.shipped} adopt=${cliHome.adopt.action}${cliHome.adopt.source ? ` source=${cliHome.adopt.source}` : ''} (${cliHome.adopt.detail})`,
+      )
+    } catch (cause) {
+      cliHome.adopt = { action: 'failed', source: '', detail: describeError(cause) }
+      logger.warn(`<cli-home> adoption failed: ${describeError(cause)}; nothing else is affected`)
+    }
+  }
+
   /* ── C. executable ───────────────────────────────────────────────────────── */
-  const discovery = discoverCommand({ command: options.command, platform })
+  let discovery = discoverCommand({
+    command: options.command,
+    platform,
+    arch,
+    env,
+    cliHome: options.cliHome,
+    candidates: searchCandidates,
+  })
   if (options.command && !discovery.found) {
     logger.warn(`configured command is not an executable file: ${options.command}`)
   }
-  if (!discovery.command) {
+
+  if (!discovery.command && configuredCommand.length === 0 && options.autoProvision) {
+    cliHome.provision = 'started'
     logger.warn(
-      `no Open Computer Use executable found (tried ${discovery.candidates.length} paths). Install it with \`npm i -g open-computer-use\` or set \`command\` to its absolute path.`,
+      `no Open Computer Use executable found (${discovery.candidates.length} candidate paths, ${cliHome.dir} included); installing it into <cli-home> with a local npm prefix — nothing global is touched, PATH is unchanged.`,
+    )
+    provisionCli({
+      cliHome: options.cliHome,
+      env,
+      platform,
+      arch,
+      logger,
+      spawnProcess: deps?.spawnProcess,
+    })
+      .then((outcome) => {
+        cliHome.provision = outcome.ok ? `ok (${outcome.action})` : `failed (${outcome.action})`
+        // Re-resolve after a successful install: `<cli-home>` now holds the
+        // executable, and it is the first thing worth looking at.
+        const settled = discoverCommand({
+          command: '',
+          platform,
+          arch,
+          env,
+          cliHome: options.cliHome,
+          candidates: searchCandidates ? [cliHome.expected, ...searchCandidates] : undefined,
+        })
+        logger.info(
+          `provision settled: ok=${outcome.ok} action=${outcome.action} via=${outcome.invocation.via} command=${settled.command ?? '<unresolved>'} source=${normalizeCommandSource(settled.source, { provisioning: outcome.ok })}${outcome.detail ? ` detail=${outcome.detail}` : ''}`,
+        )
+        if (outcome.ok) {
+          logger.warn(
+            'Open Computer Use was installed into <cli-home>. Restart the Harness (or toggle this bundle off and on) so the MCP row re-evaluates `dshHomePath(...)` and spawns the new executable.',
+          )
+        }
+      })
+      .catch((cause) => {
+        cliHome.provision = `failed (${describeError(cause)})`
+        logger.warn(`provisioning Open Computer Use failed: ${describeError(cause)}`)
+      })
+  } else if (!discovery.command && configuredCommand.length === 0) {
+    cliHome.provision = 'disabled (autoProvision=false)'
+    logger.warn(
+      `no Open Computer Use executable found (${discovery.candidates.length} candidate paths) and autoProvision is off. Install it with \`npm i -g open-computer-use\`, or set \`command\` to its absolute path, or set \`autoProvision: true\` to let this plugin install it into ${cliHome.dir}.`,
     )
   }
 
@@ -783,7 +1582,7 @@ export function apply(ctx, config) {
   }
 
   logger.info(
-    `summary platform=${platform} arch=${process.arch} serverName=${options.serverName} toolPrefix=${toolPrefix} tools=${EXPECTED_MCP_TOOLS.length} command=${discovery.command ?? '<unresolved>'} (${discovery.source}) turnBoundary=${turnBoundary} skill=${skill} schemastery=${schemastery.via || 'unavailable'}`,
+    `summary platform=${platform} arch=${arch} serverName=${options.serverName} toolPrefix=${toolPrefix} tools=${EXPECTED_MCP_TOOLS.length} command=${discovery.command ?? '<unresolved>'} (${discovery.source}) commandSource=${normalizeCommandSource(discovery.source, { adopted: cliHome.adopt, provisioning: cliHome.provision === 'started' })} cliHome=${cliHome.dir} expectedCli=${cliHome.expected} shippedCli=${cliHome.shipped} adopt=${cliHome.adopt.action} provision=${cliHome.provision} turnBoundary=${turnBoundary} skill=${skill} schemastery=${schemastery.via || 'unavailable'}`,
   )
 }
 
@@ -791,34 +1590,61 @@ export function apply(ctx, config) {
  * Self-check (exported for the verifier; no GUI surface)
  * ──────────────────────────────────────────────────────────────────────────── */
 
-/** Run one command and capture its result; never throws. */
+/**
+ * Run one command and capture its result.
+ *
+ * Never rejects. `execFile` can throw synchronously for a path Windows refuses to
+ * load (a text file at the candidate path produces `spawn UNKNOWN`, errno -4094),
+ * so the call is wrapped: `doctor()` must be able to *report* an unusable
+ * executable rather than die on it.
+ */
 function runOnce(command, args, { timeoutMs = 8000 } = {}) {
   return new Promise((resolve) => {
-    execFile(command, args, { timeout: timeoutMs, windowsHide: true, maxBuffer: 64 * 1024 }, (error, stdout, stderr) => {
-      resolve({
-        ok: !error,
-        exitCode: error ? (typeof error.code === 'number' ? error.code : null) : 0,
-        stdout: stdout ?? '',
-        stderr: stderr ?? '',
-        error: error ? describeError(error) : undefined,
+    const settle = (value) => resolve({ command, args, ...value })
+    let child
+    try {
+      child = execFile(command, args, { timeout: timeoutMs, windowsHide: true, maxBuffer: 64 * 1024 }, (error, stdout, stderr) => {
+        settle({
+          ok: !error,
+          exitCode: error ? (typeof error.code === 'number' ? error.code : null) : 0,
+          stdout: stdout ?? '',
+          stderr: stderr ?? '',
+          error: error ? describeError(error) : undefined,
+        })
       })
+    } catch (cause) {
+      settle({ ok: false, exitCode: null, stdout: '', stderr: '', error: describeError(cause) })
+      return
+    }
+    child?.on?.('error', () => {
+      /* the execFile callback already reported it */
     })
   })
 }
+
+/** This module's own `cordis.patch.yml` — the document the parity check reads. */
+export const BUNDLE_PATCH_FILE = join(MODULE_DIR, 'cordis.patch.yml')
 
 /**
  * Machine-checkable self assessment.
  *
  * @param {object} [config] row config
- * @param {{ probeTurnEnded?: boolean }} [options] `probeTurnEnded` actually runs
- *   `<command> turn-ended`, which is how the macOS-only claim is verified.
+ * @param {{ probeTurnEnded?: boolean, platform?: string, arch?: string,
+ *   env?: object, profileDir?: string }} [options]
+ *   `probeTurnEnded` actually runs `<command> turn-ended`, which is how the
+ *   macOS-only claim is verified. `profileDir` overrides where the profile-patch
+ *   conflict scan looks, which is how the self-check points it at a temp profile
+ *   instead of the caller's.
  */
-export async function doctor(config = {}, { probeTurnEnded = false, platform = process.platform, arch = process.arch, env = process.env } = {}) {
+export async function doctor(
+  config = {},
+  { probeTurnEnded = false, platform = process.platform, arch = process.arch, env = process.env, profileDir = '' } = {},
+) {
   const options = resolveConfig(config)
   const checks = []
   const add = (id, ok, detail, required = true) => checks.push({ id, ok, detail, required })
 
-  const discovery = discoverCommand({ command: options.command, platform, arch, env })
+  const discovery = discoverCommand({ command: options.command, platform, arch, env, cliHome: options.cliHome })
   add(
     'command',
     Boolean(discovery.command),
@@ -844,6 +1670,80 @@ export async function doctor(config = {}, { probeTurnEnded = false, platform = p
       )
     }
   }
+
+  /* ── D. <cli-home>: is the location the patch names actually occupied? ───── */
+  const cliHome = cliHomeDir({ cliHome: options.cliHome, env })
+  const expected = expectedCliPath({ cliHome: options.cliHome, env, platform })
+  const shipped = shippedCliPath({ env })
+  const commandSource = normalizeCommandSource(discovery.source, { provisioning: false })
+  const cliHomeFollowsPatch = isSamePath(resolve(cliHome), resolve(cliHomeDir({ env })), platform)
+
+  add(
+    'cli-home-expected',
+    isExecutableFile(expected) || Boolean(discovery.command) || Boolean(options.autoProvision),
+    `${expected} (${existsSync(expected) ? 'present' : 'absent'}; source=${commandSource}; shipped=${shipped} ${
+      existsSync(shipped) ? 'present' : 'absent'
+    })${cliHomeFollowsPatch ? '' : ` — cliHome is overridden, so the MCP row's dshHomePath(...) still looks at ${cliHomeDir({ env })} and the plugin links it`}`,
+    false,
+  )
+  add('cli-home-source', Boolean(discovery.command), `commandSource=${commandSource} via ${discovery.source}`, false)
+
+  /**
+   * The same-source contract with `cordis.patch.yml`: every `dshHomePath(...)`
+   * argument in this bundle's patch must equal `SHIPPED_CLI_RELATIVE_COMMAND`.
+   * This is a required check because a drift here makes the MCP row resolve to
+   * a path the plugin never creates — the tools would simply be absent.
+   */
+  try {
+    const patchText = await readFile(BUNDLE_PATCH_FILE, 'utf8')
+    const argumentsUsed = extractDshHomePathArguments(patchText)
+    const mismatched = argumentsUsed.filter((value) => value !== SHIPPED_CLI_RELATIVE_COMMAND)
+    add(
+      'cli-home-patch-parity',
+      argumentsUsed.length > 0 && mismatched.length === 0,
+      argumentsUsed.length === 0
+        ? `no dshHomePath(...) argument in ${BUNDLE_PATCH_FILE}`
+        : `patch=[${argumentsUsed.join(', ')}] code=[${SHIPPED_CLI_RELATIVE_COMMAND}] ${
+            mismatched.length === 0 ? 'in sync' : `MISMATCH: ${mismatched.join(', ')}`
+          }`,
+    )
+  } catch (cause) {
+    add('cli-home-patch-parity', false, `cannot read ${BUNDLE_PATCH_FILE}: ${describeError(cause)}`)
+  }
+  add(
+    'cli-home-platform-layout',
+    cliHomeRelativeCommand(platform) === SHIPPED_CLI_RELATIVE_COMMAND,
+    `platform=${platform} native=${cliHomeRelativeCommand(platform)} shipped=${SHIPPED_CLI_RELATIVE_COMMAND}${
+      cliHomeRelativeCommand(platform) === SHIPPED_CLI_RELATIVE_COMMAND
+        ? ''
+        : ' — the shipped expression names the Windows file; the plugin links it to the native binary here'
+    }`,
+    false,
+  )
+
+  /* ── D. profile-patch conflicts: report only, never repair ──────────────── */
+  const profileDirectoriesScanned = profileDir ? [profileDir] : profileDirectories(env)
+  const profilePatch = profileDirectoriesScanned.map((directory) => join(directory, 'cordis.patch.yml')).find((file) => existsSync(file))
+  let conflicts = []
+  let cleanupCommands = []
+  if (profilePatch) {
+    try {
+      conflicts = scanPatchConflicts(await readFile(profilePatch, 'utf8'))
+      cleanupCommands = conflictCleanupCommands(conflicts, profilePatch)
+    } catch (cause) {
+      add('profile-patch-scan', true, `could not read ${profilePatch}: ${describeError(cause)}`, false)
+    }
+  }
+  add(
+    'profile-patch-clean',
+    conflicts.length === 0,
+    profilePatch
+      ? conflicts.length === 0
+        ? `${profilePatch}: no upstream managed block and no other serverName: ocu row`
+        : `${profilePatch}: ${conflicts.length} conflict(s) — ${conflicts.map((c) => `${c.kind}@${c.line}${c.rowId ? `(${c.rowId})` : ''}`).join(', ')}`
+      : `no profile cordis.patch.yml among ${profileDirectoriesScanned.length} candidate directories`,
+    false,
+  )
 
   const skillDirectory = defaultSkillDirectory()
   const skillFile = join(skillDirectory, 'SKILL.md')
@@ -880,7 +1780,7 @@ export async function doctor(config = {}, { probeTurnEnded = false, platform = p
     platform,
     arch,
     node: process.version,
-    profileDirectories: profileDirectories(),
+    profileDirectories: profileDirectoriesScanned,
     schemastery: { resolved: Boolean(z), via: schemastery.via, attempts: schemastery.attempts },
     inject,
     serverName: options.serverName,
@@ -889,6 +1789,24 @@ export async function doctor(config = {}, { probeTurnEnded = false, platform = p
     command: discovery.command,
     commandSource: discovery.source,
     commandCandidates: discovery.candidates,
+    cliHome: {
+      dir: cliHome,
+      expected,
+      expectedPresent: existsSync(expected),
+      shipped,
+      shippedPresent: existsSync(shipped),
+      autoProvision: options.autoProvision,
+      relativeCommand: cliHomeRelativeCommand(platform),
+      shippedRelativeCommand: SHIPPED_CLI_RELATIVE_COMMAND,
+      patchFile: BUNDLE_PATCH_FILE,
+      resolvedFrom: commandSource,
+    },
+    profilePatch: {
+      file: profilePatch ?? '',
+      conflicts,
+      cleanupCommands,
+      note: 'reported only — this plugin never rewrites a profile patch layer',
+    },
     skill: { name: SKILL_NAME, directory: skillDirectory, file: skillFile },
     turnBoundary: { enabled: options.enableTurnBoundaryHook, argv: cleanup.argv, source: cleanup.source, reason: cleanup.reason },
     checks,
