@@ -150,7 +150,7 @@ ocu -h
 
 ### DeepSeek Harness（DSH）插件
 
-[`dsh-plugin/`](./dsh-plugin) 是一个可直接安装的 DSH bundle，把 Open Computer Use 的 9 个工具以 `mcp__ocu__*` 的形式接入 DSH profile：它自带 profile patch（插入 dsh 自带的 `@deepseek-ai/dsh-mcp-client` 行，外加负责回合边界与技能注册的 Host 侧），父 profile 一行都不用改。它是 [`scripts/install-dsh-mcp.sh`](./scripts/install-dsh-mcp.sh) 那种直接改 profile 做法的打包替代。用 DSH 插件管理器安装（`install_bundle`，target 指向 `dsh-plugin/` 的绝对路径），配置字段和验证方法见 [`dsh-plugin/README.md`](./dsh-plugin/README.md)。
+[`dsh-plugin/`](./dsh-plugin) 是一个可直接安装的 DSH bundle，把 Open Computer Use 的 9 个工具以 `mcp__ocu__*` 的形式接入 DSH profile：它自带 profile patch（插入 dsh 自带的 `@deepseek-ai/dsh-mcp-client` 行，外加负责回合边界与技能注册的 Host 侧），父 profile 一行都不用改。它是 [`scripts/install-dsh-mcp.sh`](./scripts/install-dsh-mcp.sh) 那种直接改 profile 做法的打包替代。用 DSH 插件管理器安装（`install_bundle`，target 指向 `dsh-plugin/` 的绝对路径），也可以直接按链接安装、不需要 clone 也不需要构建：生成分支 `dsh-plugin-dist` 把 bundle 放在仓库根，因此它的 tarball 地址就是合法 target —— `https://codeload.github.com/yin1895/open-computer-use/tar.gz/refs/heads/dsh-plugin-dist`。配置字段、两种装法和验证方法见 [`dsh-plugin/README.md`](./dsh-plugin/README.md)。
 
 ## 全局配置
 

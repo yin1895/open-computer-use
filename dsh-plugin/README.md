@@ -103,20 +103,67 @@ whole turn.
 | `whenToUse`    | one line on when the GUI path is the right tool                           |
 | `content`      | the `SKILL.md` body, **without** the YAML front matter and **without** a `<skill_content>` wrapper (the registry adds it) |
 | `source`       | `'runtime'`                                                               |
-| `resourceBase` | `{ kind: 'directory', path: '<repo>/skills/open-computer-use' }`          |
+| `resourceBase` | `{ kind: 'directory', path: '<resolved skill directory>' }`                |
 
 `invocation` and `provider` are deliberately **omitted**: the registry fills in
 `{ modelInvocable: true, userInvocable: true }` and the reserved provider name
 `runtime`. Because `resourceBase` is a real directory, the model sees
 `Base directory for this skill: <path>` and the relative links inside `SKILL.md`
 (`references/usage.md`, `references/troubleshooting.md`, …) resolve to real files
-in this repository — nothing is copied into `<dsh-home>/skills`.
+— nothing is copied into `<dsh-home>/skills`.
+
+`skillDirectoryCandidates()` resolves that directory against both layouts, nearest
+first, and picks the first one that exists:
+
+| Layout | Skill location | Produced by |
+| ------ | -------------- | ----------- |
+| Installed bundle | `<bundle>/skills/open-computer-use` | a link/tarball install — the bundle is unpacked on its own, so it carries its own copy |
+| This repository | `<bundle>/../skills/open-computer-use` | developing `dsh-plugin/` inside this checkout |
+
+One artifact therefore serves both, and an install needs no repository around it.
+Nothing is duplicated by hand: `scripts/build-dsh-plugin-dist.mjs` copies the
+repository's `skills/open-computer-use` into the published tree.
 
 Reading `SKILL.md` is asynchronous while `register()` is synchronous, so the
 registration is owned by `ctx.effect`: disposing the row unregisters the skill,
 including when disposal races the file read.
 
 ## Install
+
+Both routes end in the same plugin; pick by what you have.
+
+### From a link
+
+A bundle is resolved from the `package.json` that a spec names, so the bundle must
+be the **root** of whatever the link points at. In this repository the bundle sits
+in `dsh-plugin/` while the root `package.json` is Open Computer Use itself — which
+is why a spec aimed at the repository root (`github:yin1895/open-computer-use`, or a
+tarball of `main`) resolves to a non-bundle and DSH rejects it as `not-a-bundle`.
+
+`scripts/build-dsh-plugin-dist.mjs` materializes a tree whose root *is* the bundle,
+copies the skill inside it, and refuses to emit a tree DSH would reject. That tree
+is published on the generated branch `dsh-plugin-dist`, so installing needs no
+checkout and no build:
+
+```
+plugin_manager { action: "install_bundle",
+                 target: "https://codeload.github.com/yin1895/open-computer-use/tar.gz/refs/heads/dsh-plugin-dist" }
+```
+
+Republishing after a bundle change — the branch is generated, never edit it by hand:
+
+```sh
+OUT=$(mktemp -d)
+node scripts/build-dsh-plugin-dist.mjs --out "$OUT" --force
+git -C "$OUT" init -q && git -C "$OUT" add -A
+git -C "$OUT" -c user.name=build -c user.email=build@local commit -qm "build: dsh-plugin dist"
+git -C "$OUT" push --force https://github.com/yin1895/open-computer-use.git HEAD:refs/heads/dsh-plugin-dist
+```
+
+Read the `verified:` line and the file list the script prints before pushing; the
+commit message is irrelevant, the tree is the artifact.
+
+### From this checkout
 
 1. Make sure a native Open Computer Use binary exists (the global npm install
    provides one), for example on Windows:
@@ -125,15 +172,18 @@ including when disposal races the file read.
    C:\Users\Administrator\AppData\Local\nvm\v24.21.0\node_modules\open-computer-use\dist\windows\amd64\open-computer-use.exe
    ```
 
-2. Point the DSH Plugin Manager at this directory — the absolute path of
-   `dsh-plugin/`, not the repository root. `install_bundle` performs the package
-   installation and bundle selection; do not reproduce those steps with shell
-   commands. Read its returned `application` and `warnings` fields to decide
-   whether the change is live.
+2. Point the DSH Plugin Manager at the absolute path of `dsh-plugin/`, **not** the
+   repository root. `install_bundle` performs the package installation and bundle
+   selection; do not reproduce those steps with shell commands. Read its returned
+   `application` and `warnings` fields to decide whether the change is live.
 
 3. The bundle declares no build script, so `approvedBuilds` should stay empty.
    Re-installing after a JavaScript change requires a Harness restart to load a
    fresh module generation.
+
+A checkout install is saved as a `link:` dependency, so edits to `dsh-plugin/` take
+effect without reinstalling; a link install is a frozen copy that local edits never
+reach. Installing one replaces the other, in either direction.
 
 ## Difference from `scripts/install-dsh-mcp.sh`
 
@@ -434,5 +484,11 @@ native stdio MCP 服务提供；回合边界清理与技能注册则由本插件
 - `config` 是**整体替换**，不是深合并；只写一半字段会把手里的另一半丢掉。
 - `command` 必须是**绝对路径**。PATH 上的 `ocu` / `open-computer-use` 是 `.ps1` / `.cmd`
   shim，GUI 或后台启动不保证继承 PATH。
+
+**装法有两种**：给 `install_bundle` 一个**链接**（生成分支 `dsh-plugin-dist` 的 tarball 地址，
+见上面 Install 一节），或者给一个**本地目录**（本仓库的 `dsh-plugin/`）。前者是冻结副本，
+后者是 `link:` 依赖、改完即时生效。DSH 要求被指向的 `package.json` 自己声明
+`dsh.bundle.patch`——本仓库根目录是 ocu 本体、不是 bundle，所以指向仓库根会被判
+`not-a-bundle`，这就是需要那个生成分支的原因。
 
 验证：`node dsh-plugin/self-check.mjs --probe-turn-ended`（当前 34 项检查全部 PASS，退出码 0）。

@@ -1,6 +1,6 @@
 {
   "name": "@yin1895/dsh-open-computer-use",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
   "description": "DSH bundle that wires the Open Computer Use native tools into a profile through the shipped DSH MCP client, with the plugin owning process lifecycle, turn-boundary handling, and skill registration.",
@@ -30,7 +30,8 @@
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg",
-    "README.md"
+    "README.md",
+    "skills"
   ],
   "scripts": {
     "self-check": "node self-check.mjs --probe-turn-ended",

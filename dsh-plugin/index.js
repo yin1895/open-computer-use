@@ -604,9 +604,35 @@ export function installTurnBoundary(
 /** Directory of this module, and therefore of the bundle's `index.js`. */
 export const MODULE_DIR = dirname(fileURLToPath(import.meta.url))
 
-/** `dsh-plugin/` holds `index.js`; the skill lives one level up in `skills/`. */
+/**
+ * Candidate skill directories, nearest first.
+ *
+ * One artifact serves two layouts, so the skill is looked up in both:
+ *
+ *   1. `<bundle>/skills/<name>` — a bundle installed from a link is unpacked on
+ *      its own, so it carries its own copy of the skill. This is the layout a
+ *      tarball or repository install produces.
+ *   2. `<bundle>/../skills/<name>` — in this repository the bundle lives one
+ *      level below the root, where the skill is the repository's own top-level
+ *      `skills/<name>`.
+ */
+export function skillDirectoryCandidates() {
+  return [
+    join(MODULE_DIR, 'skills', SKILL_NAME),
+    join(MODULE_DIR, '..', 'skills', SKILL_NAME),
+  ]
+}
+
+/**
+ * The first candidate that exists, else the repository layout.
+ *
+ * Resolving to an existing directory keeps every caller (registration, the
+ * activation summary, `doctor`) pointing at the copy that is actually installed,
+ * and the fallback keeps `doctor` able to report the missing path.
+ */
 export function defaultSkillDirectory() {
-  return join(MODULE_DIR, '..', 'skills', SKILL_NAME)
+  const candidates = skillDirectoryCandidates()
+  return candidates.find((directory) => existsSync(directory)) ?? candidates[candidates.length - 1]
 }
 
 /** Strip a leading YAML front-matter block; its fields are passed explicitly. */

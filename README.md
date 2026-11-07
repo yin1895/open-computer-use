@@ -156,7 +156,7 @@ ocu -h
 
 ### DeepSeek Harness (DSH) plugin
 
-The [`dsh-plugin/`](./dsh-plugin) directory is an installable DSH bundle that brings the nine Open Computer Use tools into a DSH profile as `mcp__ocu__*`: it declares its own profile patch — the shipped `@deepseek-ai/dsh-mcp-client` row plus a Host half that owns the turn boundary and skill registration — and leaves the parent profile untouched. It is the packaged successor to the profile-patching [`scripts/install-dsh-mcp.sh`](./scripts/install-dsh-mcp.sh). Install it with the DSH Plugin Manager (`install_bundle`, target = the absolute path of `dsh-plugin/`); configuration fields and verification steps are in [`dsh-plugin/README.md`](./dsh-plugin/README.md).
+The [`dsh-plugin/`](./dsh-plugin) directory is an installable DSH bundle that brings the nine Open Computer Use tools into a DSH profile as `mcp__ocu__*`: it declares its own profile patch — the shipped `@deepseek-ai/dsh-mcp-client` row plus a Host half that owns the turn boundary and skill registration — and leaves the parent profile untouched. It is the packaged successor to the profile-patching [`scripts/install-dsh-mcp.sh`](./scripts/install-dsh-mcp.sh). Install it with the DSH Plugin Manager (`install_bundle`, target = the absolute path of `dsh-plugin/`), or straight from a link with no checkout and no build: the generated `dsh-plugin-dist` branch publishes the bundle at its root, so its tarball URL is a valid target — `https://codeload.github.com/yin1895/open-computer-use/tar.gz/refs/heads/dsh-plugin-dist`. Configuration fields, both installation routes, and verification steps are in [`dsh-plugin/README.md`](./dsh-plugin/README.md).
 
 ## Global Configuration
 
