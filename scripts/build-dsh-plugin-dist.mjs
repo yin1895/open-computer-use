@@ -39,10 +39,22 @@ const BUNDLE_DIR = join(REPO_ROOT, 'dsh-plugin')
 const SKILL_NAME = 'open-computer-use'
 const SKILL_SOURCE = join(REPO_ROOT, 'skills', SKILL_NAME)
 
-/** Bundle files copied to the tree root. */
-const ROOT_FILES = ['index.js', 'self-check.mjs', 'cordis.patch.yml', 'package.json', 'icon.svg', 'README.md']
-/** Bundle directories copied to the tree root. */
-const ROOT_DIRS = ['locale']
+/**
+ * Entries that are never copied.
+ *
+ * The complement of this set is what ships, on purpose: a whitelist silently
+ * drops a newly added module from the published tree, and that failure is only
+ * visible to whoever installs it. One extra file is the cheaper mistake.
+ */
+const EXCLUDED = new Set(['node_modules', '.git', '.gitignore', '.DS_Store'])
+
+/** Top-level bundle entries to copy, in a stable order. */
+function bundleEntries() {
+  return readdirSync(BUNDLE_DIR, { withFileTypes: true })
+    .map((entry) => entry.name)
+    .filter((name) => !EXCLUDED.has(name))
+    .sort()
+}
 
 function parseArgs(argv) {
   const options = { out: '', force: false, dryRun: false }
@@ -147,8 +159,7 @@ function main() {
 
   if (options.dryRun) {
     process.stdout.write(`would build ${manifest.name}@${manifest.version} into ${out}\n`)
-    for (const file of ROOT_FILES) process.stdout.write(`  ${file}\n`)
-    for (const dir of ROOT_DIRS) process.stdout.write(`  ${dir}/\n`)
+    for (const name of bundleEntries()) process.stdout.write(`  ${name}\n`)
     process.stdout.write(`  skills/${SKILL_NAME}/\n`)
     return
   }
@@ -156,15 +167,11 @@ function main() {
   if (alreadyThere) rmSync(out, { recursive: true, force: true })
   mkdirSync(out, { recursive: true })
 
-  for (const file of ROOT_FILES) {
-    const source = join(BUNDLE_DIR, file)
-    if (!existsSync(source)) fail(`bundle is missing ${file}`)
-    cpSync(source, join(out, file))
-  }
-  for (const dir of ROOT_DIRS) {
-    const source = join(BUNDLE_DIR, dir)
-    if (!existsSync(source)) fail(`bundle is missing ${dir}/`)
-    cpSync(source, join(out, dir), { recursive: true })
+  // The bundle directory is self-contained: everything it holds ships, minus
+  // EXCLUDED. A whitelist here would silently drop a newly added module from the
+  // published tree, and only whoever installs it would ever notice.
+  for (const name of bundleEntries()) {
+    cpSync(join(BUNDLE_DIR, name), join(out, name), { recursive: true })
   }
 
   // The installed bundle is unpacked on its own, so it must carry the skill.
